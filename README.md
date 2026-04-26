@@ -5,6 +5,8 @@ This repository contains my Hack The Box writeups and notes.
 ## Structure
 
 - `windows/` → Windows-based machines
+- SMB Admin → PsExec (10.129.35.38)
+  
 - `linux/` → Linux-based machines
 - Each folder contains individual machine writeups
 
